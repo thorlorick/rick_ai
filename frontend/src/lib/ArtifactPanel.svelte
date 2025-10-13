@@ -32,11 +32,6 @@
     }
   });
   
-  let selectedArtifact = null;
-  let copySuccess = {};
-  
-  const dispatch = createEventDispatcher();
-  
   $: if (artifacts.length > 0 && !selectedArtifact) {
     selectedArtifact = artifacts[artifacts.length - 1];
   }
