@@ -17,7 +17,7 @@ app = FastAPI(title="Rick_AI Backend", version="1.0.0")
 # CORS - allow frontend to connect
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # SvelteKit dev servers
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
