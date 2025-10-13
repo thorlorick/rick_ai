@@ -11,6 +11,32 @@
   
   const dispatch = createEventDispatcher();
   
+  // Load Prism.js only in the browser
+  onMount(async () => {
+    if (browser) {
+      const prismModule = await import('prismjs');
+      Prism = prismModule.default;
+      
+      // Import languages
+      await import('prismjs/components/prism-python');
+      await import('prismjs/components/prism-javascript');
+      await import('prismjs/components/prism-typescript');
+      await import('prismjs/components/prism-rust');
+      await import('prismjs/components/prism-go');
+      await import('prismjs/components/prism-java');
+      await import('prismjs/components/prism-css');
+      await import('prismjs/components/prism-bash');
+      
+      // Import theme CSS
+      await import('prismjs/themes/prism-tomorrow.css');
+    }
+  });
+  
+  let selectedArtifact = null;
+  let copySuccess = {};
+  
+  const dispatch = createEventDispatcher();
+  
   $: if (artifacts.length > 0 && !selectedArtifact) {
     selectedArtifact = artifacts[artifacts.length - 1];
   }
@@ -21,7 +47,21 @@
   
   async function copyToClipboard(artifactId, code) {
     try {
-      await navigator.clipboard.writeText(code);
+      // Try modern clipboard API first
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(code);
+      } else {
+        // Fallback for older browsers or non-HTTPS
+        const textArea = document.createElement('textarea');
+        textArea.value = code;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      }
+      
       copySuccess[artifactId] = true;
       setTimeout(() => {
         copySuccess[artifactId] = false;
@@ -29,6 +69,7 @@
       }, 2000);
     } catch (err) {
       console.error('Failed to copy:', err);
+      alert('Copy failed. Please select and copy manually.');
     }
   }
   
@@ -53,6 +94,8 @@
   }
   
   function getHighlightedCode(code, language) {
+    if (!Prism || !browser) return code;
+    
     try {
       const grammar = Prism.languages[language] || Prism.languages.text;
       return Prism.highlight(code, grammar, language);
