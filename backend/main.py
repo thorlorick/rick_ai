@@ -198,7 +198,7 @@ async def startup_event():
     global llm
     
     # TODO: Update this path to your actual model location
-    model_path = "./models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+   model_path = "../models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
     
     try:
         llm = LLMEngine(model_path=model_path)
