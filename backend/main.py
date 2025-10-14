@@ -219,21 +219,36 @@ async def root():
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     """
-    Main chat endpoint with streaming support
+    Main chat endpoint with streaming support and memory
     Returns Server-Sent Events (SSE) stream
     """
     
     if llm is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
+    # Generate conversation ID if not provided
+    conversation_id = f"conv-{datetime.now().timestamp()}"
+    
     async def event_generator():
         """Generate SSE events"""
         
         try:
-            # Build prompt
-            prompt = llm.build_prompt(request.message, request.conversation_history)
+            # Add user message to vector memory
+            vector_memory.add_message(
+                conversation_id=conversation_id,
+                role="user",
+                content=request.message,
+                timestamp=datetime.now().isoformat()
+            )
             
-            # Accumulate response for artifact extraction
+            # Build prompt with memory context
+            prompt = llm.build_prompt(
+                request.message, 
+                request.conversation_history,
+                conversation_id=conversation_id
+            )
+            
+            # Accumulate response for artifact extraction and memory
             full_response = ""
             
             # Stream tokens
@@ -247,6 +262,14 @@ async def chat_endpoint(request: ChatRequest):
                 # Send token as SSE
                 data = json.dumps({"type": "token", "content": token})
                 yield f"data: {data}\n\n"
+            
+            # Add assistant response to vector memory
+            vector_memory.add_message(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=full_response,
+                timestamp=datetime.now().isoformat()
+            )
             
             # Extract and send artifacts
             artifacts = ArtifactParser.extract_artifacts(full_response)
