@@ -11,13 +11,22 @@ import json
 import re
 from datetime import datetime
 import asyncio
+import uuid
+
+# Import memory managers
+from memory import ConversationMemory
+from vector_memory import VectorMemory
 
 app = FastAPI(title="Rick_AI Backend", version="1.0.0")
+
+# Initialize memory systems
+memory = ConversationMemory()
+vector_memory = VectorMemory()  # Semantic memory
 
 # CORS - allow frontend to connect
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # SvelteKit dev servers
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -189,7 +198,7 @@ async def startup_event():
     global llm
     
     # TODO: Update this path to your actual model location
-    model_path = "/home/spraggs/rick_ai/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+    model_path = "./models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
     
     try:
         llm = LLMEngine(model_path=model_path)
@@ -276,6 +285,56 @@ async def health_check():
         "model_loaded": llm is not None,
         "timestamp": datetime.now().isoformat()
     }
+
+# ============================================================================
+# Memory / Conversation Endpoints
+# ============================================================================
+
+@app.post("/conversations/save")
+async def save_conversation(conversation_id: str, messages: List[ChatMessage], title: Optional[str] = None):
+    """Save a conversation"""
+    metadata = {"title": title} if title else {}
+    success = memory.save_conversation(
+        conversation_id,
+        [msg.dict() for msg in messages],
+        metadata
+    )
+    
+    if success:
+        return {"status": "saved", "conversation_id": conversation_id}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to save conversation")
+
+@app.get("/conversations/list")
+async def list_conversations(limit: int = 50):
+    """List all saved conversations"""
+    conversations = memory.list_conversations(limit)
+    return {"conversations": conversations}
+
+@app.get("/conversations/{conversation_id}")
+async def load_conversation(conversation_id: str):
+    """Load a specific conversation"""
+    conversation = memory.load_conversation(conversation_id)
+    
+    if conversation:
+        return conversation
+    else:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """Delete a conversation"""
+    success = memory.delete_conversation(conversation_id)
+    
+    if success:
+        return {"status": "deleted", "conversation_id": conversation_id}
+    else:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+@app.get("/conversations/stats")
+async def get_storage_stats():
+    """Get storage statistics"""
+    return memory.get_storage_stats()
 
 # ============================================================================
 # Run with: uvicorn main:app --reload --host 0.0.0.0 --port 8000
