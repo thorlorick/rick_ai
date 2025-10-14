@@ -116,8 +116,8 @@
 
 <div class="app-container">
   <header>
-    <h1>🤖 Rick_AI</h1>
-    <p>Your Personal Coding Assistant</p>
+    <h1>🤖 Rick</h1>
+    <p>What can I do for you today?</p>
   </header>
   
   <main class="main-content">
