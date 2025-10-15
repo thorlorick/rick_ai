@@ -1,6 +1,6 @@
 """
 Rick_AI Backend Server
-FastAPI server with streaming LLM responses and artifact management
+FastAPI server with streaming LLM responses, vector memory, and calendar integration
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,29 +11,47 @@ import json
 import re
 from datetime import datetime
 import asyncio
-import uuid
 
 # Import memory managers
 from memory import ConversationMemory
 from vector_memory import VectorMemory
 
+# Import calendar tool
+try:
+    from calendar_tool import GoogleCalendarTool
+    calendar_tool = GoogleCalendarTool()
+    CALENDAR_ENABLED = True
+    print("✓ Google Calendar connected!")
+except Exception as e:
+    calendar_tool = None
+    CALENDAR_ENABLED = False
+    print(f"⚠ Google Calendar not available: {e}")
+
 app = FastAPI(title="Rick_AI Backend", version="1.0.0")
 
 # Initialize memory systems
 memory = ConversationMemory()
-vector_memory = VectorMemory()  # Semantic memory
+vector_memory = VectorMemory()
 
-# CORS - allow frontend to connect
+# Global LLM instance (initialized on startup)
+llm = None
+
+# ============================================================================
+# CORS Configuration
+# ============================================================================
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],  # Allow all origins for development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global LLM instance (initialized on startup)
-llm = None
+@app.options("/chat")
+async def chat_options():
+    """Handle CORS preflight for chat endpoint"""
+    return {}
 
 # ============================================================================
 # Models / Schemas
@@ -69,7 +87,7 @@ class LLMEngine:
             self.llm = Llama(
                 model_path=model_path,
                 n_ctx=n_ctx,
-                n_threads=4,  # Use all 4 cores on N95
+                n_threads=4,
                 n_batch=512,
                 verbose=False
             )
@@ -78,24 +96,56 @@ class LLMEngine:
             print(f"✗ Failed to load model: {e}")
             raise
     
-    def build_prompt(self, message: str, history: List[ChatMessage]) -> str:
-        """Build a proper prompt with conversation history"""
+    def build_prompt(self, message: str, history: List[ChatMessage], conversation_id: Optional[str] = None) -> str:
+        """Build a prompt with conversation history, semantic memory, and calendar context"""
         
-        # System prompt for coding assistant
-        system = """You are Rick, a skilled coding assistant. You help users with:
+        # System prompt
+        system = """You are Rick, a skilled coding assistant with access to the user's Google Calendar.
+
+You help users with:
 - Writing clean, efficient code
 - Debugging and explaining code
 - Answering programming questions
 - Providing best practices and patterns
+- Checking their calendar when asked
+- Remembering past conversations
 
-When you write code, use markdown code blocks with the language specified.
-Keep responses concise but thorough. Be helpful and encouraging."""
+When writing code, use markdown code blocks with the language specified.
+Keep responses concise but thorough. Be helpful and encouraging.
+
+If the user asks about their calendar/schedule/meetings, you have access to that information.
+If the user references past conversations or asks you to remember something, you can recall it from your memory."""
         
-        # Build conversation context
         prompt = f"{system}\n\n"
         
-        # Add history
-        for msg in history[-6:]:  # Keep last 6 messages for context
+        # Check if this is a calendar query
+        calendar_keywords = ['calendar', 'schedule', 'meeting', 'event', 'appointment', 'today', 'tomorrow', 'this week']
+        is_calendar_query = any(keyword in message.lower() for keyword in calendar_keywords)
+        
+        # Add calendar context if relevant
+        if is_calendar_query and CALENDAR_ENABLED and calendar_tool:
+            try:
+                events = calendar_tool.get_events_this_week()
+                if events:
+                    calendar_context = "=== USER'S CALENDAR ===\n"
+                    calendar_context += calendar_tool.format_events_for_llm(events)
+                    calendar_context += "=======================\n\n"
+                    prompt += calendar_context
+            except Exception as e:
+                print(f"Error fetching calendar: {e}")
+        
+        # Get relevant memories from past conversations
+        if message and conversation_id:
+            memory_context = vector_memory.get_conversation_context(
+                query=message,
+                n_results=3,
+                exclude_conversation=conversation_id
+            )
+            if memory_context:
+                prompt += memory_context
+        
+        # Add recent history from current conversation
+        for msg in history[-6:]:
             role = msg.role.capitalize()
             prompt += f"{role}: {msg.content}\n\n"
         
@@ -121,7 +171,7 @@ Keep responses concise but thorough. Be helpful and encouraging."""
                 if output and 'choices' in output:
                     token = output['choices'][0]['text']
                     yield token
-                    await asyncio.sleep(0)  # Allow other tasks to run
+                    await asyncio.sleep(0)
                     
         except Exception as e:
             print(f"Generation error: {e}")
@@ -138,7 +188,6 @@ class ArtifactParser:
     def extract_artifacts(text: str) -> List[Artifact]:
         """Find all code blocks in markdown format"""
         
-        # Regex to match ```language\ncode\n```
         pattern = r'```(\w+)?\n(.*?)```'
         matches = re.finditer(pattern, text, re.DOTALL)
         
@@ -161,10 +210,9 @@ class ArtifactParser:
     def _suggest_filename(language: str, code: str) -> str:
         """Suggest a filename based on language and content"""
         
-        # Try to extract filename from common patterns
         filename_patterns = [
-            r'#\s*filename:\s*(\S+)',  # Python/Shell comment
-            r'//\s*filename:\s*(\S+)',  # C-style comment
+            r'#\s*filename:\s*(\S+)',
+            r'//\s*filename:\s*(\S+)',
         ]
         
         for pattern in filename_patterns:
@@ -172,7 +220,6 @@ class ArtifactParser:
             if match:
                 return match.group(1)
         
-        # Default filenames by language
         extensions = {
             "python": "script.py",
             "javascript": "script.js",
@@ -197,7 +244,6 @@ async def startup_event():
     """Initialize LLM on server start"""
     global llm
     
-    # TODO: Update this path to your actual model location
     model_path = "../models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
     
     try:
@@ -213,20 +259,21 @@ async def root():
     return {
         "status": "online",
         "model_loaded": llm is not None,
+        "calendar_enabled": CALENDAR_ENABLED,
         "message": "Rick_AI Backend API"
     }
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     """
-    Main chat endpoint with streaming support and memory
+    Main chat endpoint with streaming support, memory, and calendar
     Returns Server-Sent Events (SSE) stream
     """
     
     if llm is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
-    # Generate conversation ID if not provided
+    # Generate conversation ID
     conversation_id = f"conv-{datetime.now().timestamp()}"
     
     async def event_generator():
@@ -241,14 +288,14 @@ async def chat_endpoint(request: ChatRequest):
                 timestamp=datetime.now().isoformat()
             )
             
-            # Build prompt with memory context
+            # Build prompt with memory and calendar context
             prompt = llm.build_prompt(
                 request.message, 
                 request.conversation_history,
                 conversation_id=conversation_id
             )
             
-            # Accumulate response for artifact extraction and memory
+            # Accumulate response
             full_response = ""
             
             # Stream tokens
@@ -306,6 +353,7 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": llm is not None,
+        "calendar_enabled": CALENDAR_ENABLED,
         "timestamp": datetime.now().isoformat()
     }
 
@@ -357,7 +405,70 @@ async def delete_conversation(conversation_id: str):
 @app.get("/conversations/stats")
 async def get_storage_stats():
     """Get storage statistics"""
-    return memory.get_storage_stats()
+    file_stats = memory.get_storage_stats()
+    vector_stats = vector_memory.get_stats()
+    
+    return {
+        "file_storage": file_stats,
+        "vector_memory": vector_stats
+    }
+
+@app.post("/memory/search")
+async def search_memory(query: str, n_results: int = 5):
+    """Search vector memory"""
+    results = vector_memory.search_memory(query, n_results=n_results)
+    
+    # Format results
+    formatted = []
+    if results["documents"][0]:
+        for doc, meta, distance in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0]
+        ):
+            formatted.append({
+                "content": doc,
+                "metadata": meta,
+                "similarity": 1 - distance
+            })
+    
+    return {"results": formatted, "count": len(formatted)}
+
+# ============================================================================
+# Calendar Endpoints
+# ============================================================================
+
+@app.get("/calendar/today")
+async def get_calendar_today():
+    """Get today's calendar events"""
+    if not CALENDAR_ENABLED:
+        raise HTTPException(status_code=503, detail="Calendar not available")
+    
+    try:
+        events = calendar_tool.get_events_today()
+        return {
+            "events": events,
+            "count": len(events),
+            "formatted": calendar_tool.format_events_for_llm(events)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/calendar/week")
+async def get_calendar_week():
+    """Get this week's calendar events"""
+    if not CALENDAR_ENABLED:
+        raise HTTPException(status_code=503, detail="Calendar not available")
+    
+    try:
+        events = calendar_tool.get_events_this_week()
+        return {
+            "events": events,
+            "count": len(events),
+            "formatted": calendar_tool.format_events_for_llm(events)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
 # Run with: uvicorn main:app --reload --host 0.0.0.0 --port 8000
