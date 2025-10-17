@@ -1,5 +1,5 @@
 """
-Rick_AI Backend Server
+Rick_AI Backend Server with OpenRouter
 FastAPI server with streaming LLM responses, vector memory, and calendar integration
 """
 from fastapi import FastAPI, HTTPException
@@ -11,6 +11,12 @@ import json
 import re
 from datetime import datetime
 import asyncio
+import os
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+
+# Load environment variables
+load_dotenv()
 
 # Import memory managers
 from memory import ConversationMemory
@@ -27,14 +33,25 @@ except Exception as e:
     CALENDAR_ENABLED = False
     print(f"⚠ Google Calendar not available: {e}")
 
-app = FastAPI(title="Rick_AI Backend", version="1.0.0")
+app = FastAPI(title="Rick_AI Backend", version="2.0.0")
 
 # Initialize memory systems
 memory = ConversationMemory()
 vector_memory = VectorMemory()
 
-# Global LLM instance (initialized on startup)
-llm = None
+# Initialize OpenRouter client
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    print("⚠ WARNING: OPENROUTER_API_KEY not found in .env file")
+
+client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
+
+# Model configuration
+MODEL_NAME = "nvidia/nemotron-nano-9b-v2:free"  # Free tier, upgrade to paid if needed
+# MODEL_NAME = "nvidia/nemotron-nano-9b-v2"  # Paid tier (better quality/speed)
 
 # ============================================================================
 # CORS Configuration
@@ -42,7 +59,7 @@ llm = None
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -50,7 +67,7 @@ app.add_middleware(
 
 @app.options("/chat")
 async def chat_options():
-    """Handle CORS preflight for chat endpoint"""
+    """Handle CORS preflight"""
     return {}
 
 # ============================================================================
@@ -58,7 +75,7 @@ async def chat_options():
 # ============================================================================
 
 class ChatMessage(BaseModel):
-    role: str  # "user" or "assistant"
+    role: str
     content: str
     timestamp: Optional[str] = None
 
@@ -75,32 +92,26 @@ class Artifact(BaseModel):
     filename: Optional[str] = None
 
 # ============================================================================
-# LLM Engine
+# LLM Engine (OpenRouter)
 # ============================================================================
 
-class LLMEngine:
-    """Handles interaction with the language model"""
+class OpenRouterEngine:
+    """Handles interaction with OpenRouter API"""
     
-    def __init__(self, model_path: str, n_ctx: int = 4096):
-        try:
-            from llama_cpp import Llama
-            self.llm = Llama(
-                model_path=model_path,
-                n_ctx=n_ctx,
-                n_threads=4,
-                n_batch=512,
-                verbose=False
-            )
-            print(f"✓ Model loaded: {model_path}")
-        except Exception as e:
-            print(f"✗ Failed to load model: {e}")
-            raise
+    def __init__(self):
+        self.model = MODEL_NAME
+        print(f"✓ Using model: {self.model}")
     
-    def build_prompt(self, message: str, history: List[ChatMessage], conversation_id: Optional[str] = None) -> str:
-        """Build a prompt with conversation history, semantic memory, and calendar context"""
+    def build_prompt_messages(
+        self, 
+        message: str, 
+        history: List[ChatMessage],
+        conversation_id: Optional[str] = None
+    ) -> List[Dict]:
+        """Build messages array for OpenRouter API with memory and calendar"""
         
-        # System prompt
-        system = """You are Rick, a skilled coding assistant with access to the user's Google Calendar.
+        # System message
+        system_content = """You are Rick, a skilled coding assistant with access to the user's Google Calendar and memory of past conversations.
 
 You help users with:
 - Writing clean, efficient code
@@ -111,30 +122,24 @@ You help users with:
 - Remembering past conversations
 
 When writing code, use markdown code blocks with the language specified.
-Keep responses concise but thorough. Be helpful and encouraging.
+Keep responses concise but thorough. Be helpful and encouraging."""
 
-If the user asks about their calendar/schedule/meetings, you have access to that information.
-If the user references past conversations or asks you to remember something, you can recall it from your memory."""
-        
-        prompt = f"{system}\n\n"
-        
-        # Check if this is a calendar query
+        # Check for calendar query
         calendar_keywords = ['calendar', 'schedule', 'meeting', 'event', 'appointment', 'today', 'tomorrow', 'this week']
         is_calendar_query = any(keyword in message.lower() for keyword in calendar_keywords)
         
-        # Add calendar context if relevant
+        # Add calendar context
         if is_calendar_query and CALENDAR_ENABLED and calendar_tool:
             try:
                 events = calendar_tool.get_events_this_week()
                 if events:
-                    calendar_context = "=== USER'S CALENDAR ===\n"
-                    calendar_context += calendar_tool.format_events_for_llm(events)
-                    calendar_context += "=======================\n\n"
-                    prompt += calendar_context
+                    system_content += "\n\n=== USER'S CALENDAR ===\n"
+                    system_content += calendar_tool.format_events_for_llm(events)
+                    system_content += "=======================\n"
             except Exception as e:
                 print(f"Error fetching calendar: {e}")
         
-        # Get relevant memories from past conversations
+        # Get relevant memories
         if message and conversation_id:
             memory_context = vector_memory.get_conversation_context(
                 query=message,
@@ -142,39 +147,49 @@ If the user references past conversations or asks you to remember something, you
                 exclude_conversation=conversation_id
             )
             if memory_context:
-                prompt += memory_context
+                system_content += "\n\n" + memory_context
         
-        # Add recent history from current conversation
+        # Build messages array
+        messages = [{"role": "system", "content": system_content}]
+        
+        # Add conversation history (last 6 messages)
         for msg in history[-6:]:
-            role = msg.role.capitalize()
-            prompt += f"{role}: {msg.content}\n\n"
+            messages.append({
+                "role": msg.role,
+                "content": msg.content
+            })
         
         # Add current message
-        prompt += f"User: {message}\n\nAssistant:"
+        messages.append({
+            "role": "user",
+            "content": message
+        })
         
-        return prompt
+        return messages
     
-    async def generate_stream(self, prompt: str, max_tokens: int = 1024, temperature: float = 0.7):
-        """Generate streaming response"""
+    async def generate_stream(
+        self,
+        messages: List[Dict],
+        max_tokens: int = 1024,
+        temperature: float = 0.7
+    ):
+        """Generate streaming response from OpenRouter"""
         
         try:
-            stream = self.llm(
-                prompt,
+            stream = await client.chat.completions.create(
+                model=self.model,
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                top_p=0.95,
-                stream=True,
-                stop=["User:", "Human:"]
+                stream=True
             )
             
-            for output in stream:
-                if output and 'choices' in output:
-                    token = output['choices'][0]['text']
-                    yield token
-                    await asyncio.sleep(0)
+            async for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
                     
         except Exception as e:
-            print(f"Generation error: {e}")
+            print(f"OpenRouter API error: {e}")
             yield f"\n\n[Error: {str(e)}]"
 
 # ============================================================================
@@ -208,17 +223,7 @@ class ArtifactParser:
     
     @staticmethod
     def _suggest_filename(language: str, code: str) -> str:
-        """Suggest a filename based on language and content"""
-        
-        filename_patterns = [
-            r'#\s*filename:\s*(\S+)',
-            r'//\s*filename:\s*(\S+)',
-        ]
-        
-        for pattern in filename_patterns:
-            match = re.search(pattern, code, re.IGNORECASE)
-            if match:
-                return match.group(1)
+        """Suggest a filename based on language"""
         
         extensions = {
             "python": "script.py",
@@ -239,41 +244,46 @@ class ArtifactParser:
 # API Endpoints
 # ============================================================================
 
+# Global engine instance
+llm = None
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize LLM on server start"""
+    """Initialize OpenRouter engine"""
     global llm
     
-    model_path = "../models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+    if not OPENROUTER_API_KEY:
+        print("✗ OpenRouter API key not found!")
+        print("  Add OPENROUTER_API_KEY to .env file")
+        return
     
     try:
-        llm = LLMEngine(model_path=model_path)
-        print("✓ Rick_AI backend ready!")
+        llm = OpenRouterEngine()
+        print("✓ Rick_AI backend ready with OpenRouter!")
     except Exception as e:
         print(f"✗ Failed to initialize: {e}")
-        print("⚠ Server will run but /chat endpoint will fail")
 
 @app.get("/")
 async def root():
     """Health check"""
     return {
         "status": "online",
-        "model_loaded": llm is not None,
+        "engine": "openrouter",
+        "model": MODEL_NAME,
         "calendar_enabled": CALENDAR_ENABLED,
         "message": "Rick_AI Backend API"
     }
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    """
-    Main chat endpoint with streaming support, memory, and calendar
-    Returns Server-Sent Events (SSE) stream
-    """
+    """Main chat endpoint with streaming, memory, and calendar"""
     
     if llm is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+        raise HTTPException(status_code=503, detail="LLM engine not initialized")
     
-    # Generate conversation ID
+    if not OPENROUTER_API_KEY:
+        raise HTTPException(status_code=503, detail="OpenRouter API key not configured")
+    
     conversation_id = f"conv-{datetime.now().timestamp()}"
     
     async def event_generator():
@@ -288,19 +298,18 @@ async def chat_endpoint(request: ChatRequest):
                 timestamp=datetime.now().isoformat()
             )
             
-            # Build prompt with memory and calendar context
-            prompt = llm.build_prompt(
-                request.message, 
+            # Build messages for API
+            messages = llm.build_prompt_messages(
+                request.message,
                 request.conversation_history,
                 conversation_id=conversation_id
             )
             
-            # Accumulate response
+            # Stream response
             full_response = ""
             
-            # Stream tokens
             async for token in llm.generate_stream(
-                prompt,
+                messages,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature
             ):
@@ -328,7 +337,7 @@ async def chat_endpoint(request: ChatRequest):
                     })
                     yield f"data: {data}\n\n"
             
-            # Send completion signal
+            # Send completion
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             
         except Exception as e:
@@ -352,55 +361,16 @@ async def health_check():
     """Detailed health check"""
     return {
         "status": "healthy",
-        "model_loaded": llm is not None,
+        "engine": "openrouter",
+        "model": MODEL_NAME,
         "calendar_enabled": CALENDAR_ENABLED,
+        "api_key_configured": bool(OPENROUTER_API_KEY),
         "timestamp": datetime.now().isoformat()
     }
 
 # ============================================================================
-# Memory / Conversation Endpoints
+# Memory Endpoints
 # ============================================================================
-
-@app.post("/conversations/save")
-async def save_conversation(conversation_id: str, messages: List[ChatMessage], title: Optional[str] = None):
-    """Save a conversation"""
-    metadata = {"title": title} if title else {}
-    success = memory.save_conversation(
-        conversation_id,
-        [msg.dict() for msg in messages],
-        metadata
-    )
-    
-    if success:
-        return {"status": "saved", "conversation_id": conversation_id}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to save conversation")
-
-@app.get("/conversations/list")
-async def list_conversations(limit: int = 50):
-    """List all saved conversations"""
-    conversations = memory.list_conversations(limit)
-    return {"conversations": conversations}
-
-@app.get("/conversations/{conversation_id}")
-async def load_conversation(conversation_id: str):
-    """Load a specific conversation"""
-    conversation = memory.load_conversation(conversation_id)
-    
-    if conversation:
-        return conversation
-    else:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-@app.delete("/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str):
-    """Delete a conversation"""
-    success = memory.delete_conversation(conversation_id)
-    
-    if success:
-        return {"status": "deleted", "conversation_id": conversation_id}
-    else:
-        raise HTTPException(status_code=404, detail="Conversation not found")
 
 @app.get("/conversations/stats")
 async def get_storage_stats():
@@ -418,7 +388,6 @@ async def search_memory(query: str, n_results: int = 5):
     """Search vector memory"""
     results = vector_memory.search_memory(query, n_results=n_results)
     
-    # Format results
     formatted = []
     if results["documents"][0]:
         for doc, meta, distance in zip(
@@ -440,7 +409,7 @@ async def search_memory(query: str, n_results: int = 5):
 
 @app.get("/calendar/today")
 async def get_calendar_today():
-    """Get today's calendar events"""
+    """Get today's events"""
     if not CALENDAR_ENABLED:
         raise HTTPException(status_code=503, detail="Calendar not available")
     
@@ -456,7 +425,7 @@ async def get_calendar_today():
 
 @app.get("/calendar/week")
 async def get_calendar_week():
-    """Get this week's calendar events"""
+    """Get this week's events"""
     if not CALENDAR_ENABLED:
         raise HTTPException(status_code=503, detail="Calendar not available")
     
@@ -471,5 +440,5 @@ async def get_calendar_week():
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
-# Run with: uvicorn main:app --reload --host 0.0.0.0 --port 8000
+# Run with: uvicorn main:app --host 0.0.0.0 --port 8000
 # ============================================================================
