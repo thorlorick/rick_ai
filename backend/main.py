@@ -275,78 +275,69 @@ async def root():
     }
 
 @app.post("/chat")
-async def chat_endpoint(request: ChatRequest):
-    """Main chat endpoint with streaming, memory, and calendar"""
-    
+async def chat_endpoint(request: ChatRequest, conversation_id: Optional[str] = None):
+    """Main chat endpoint with streaming, memory, and calendar support"""
+
     if llm is None:
         raise HTTPException(status_code=503, detail="LLM engine not initialized")
-    
     if not OPENROUTER_API_KEY:
         raise HTTPException(status_code=503, detail="OpenRouter API key not configured")
-    
-    conversation_id = f"conv-{datetime.now().timestamp()}"
-    
+
+    # Use provided conversation_id or create a new one
+    conversation_id = conversation_id or f"conv-{datetime.now().timestamp()}"
+
     async def event_generator():
-        """Generate SSE events"""
-        
+        """Generate streaming SSE events"""
+
         try:
-            # Add user message to vector memory
+            # Store user message in vector memory
             vector_memory.add_message(
                 conversation_id=conversation_id,
                 role="user",
                 content=request.message,
                 timestamp=datetime.now().isoformat()
             )
-            
-            # Build messages for API
-            messages = llm.build_prompt_messages(
+
+            # Build messages for LLM
+            messages = await asyncio.to_thread(
+                llm.build_prompt_messages,
                 request.message,
                 request.conversation_history,
-                conversation_id=conversation_id
+                conversation_id
             )
-            
-            # Stream response
+
+            # Stream LLM response
             full_response = ""
-            
             async for token in llm.generate_stream(
                 messages,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature
             ):
                 full_response += token
-                
-                # Send token as SSE
                 data = json.dumps({"type": "token", "content": token})
                 yield f"data: {data}\n\n"
-            
-            # Add assistant response to vector memory
+
+            # Store assistant response in vector memory
             vector_memory.add_message(
                 conversation_id=conversation_id,
                 role="assistant",
                 content=full_response,
                 timestamp=datetime.now().isoformat()
             )
-            
+
             # Extract and send artifacts
             artifacts = ArtifactParser.extract_artifacts(full_response)
-            if artifacts:
-                for artifact in artifacts:
-                    data = json.dumps({
-                        "type": "artifact",
-                        "artifact": artifact.dict()
-                    })
-                    yield f"data: {data}\n\n"
-            
-            # Send completion
+            for artifact in artifacts:
+                data = json.dumps({"type": "artifact", "artifact": artifact.dict()})
+                yield f"data: {data}\n\n"
+
+            # Completion
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
-            
+
         except Exception as e:
-            error_data = json.dumps({
-                "type": "error",
-                "message": str(e)
-            })
+            error_data = json.dumps({"type": "error", "message": str(e)})
             yield f"data: {error_data}\n\n"
-    
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -355,6 +346,7 @@ async def chat_endpoint(request: ChatRequest):
             "Connection": "keep-alive",
         }
     )
+
 
 @app.get("/health")
 async def health_check():
