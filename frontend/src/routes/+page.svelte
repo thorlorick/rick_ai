@@ -25,7 +25,7 @@
   }
   
   async function streamResponse(message) {
-    const API_URL = 'http://192.168.2.13:8000';
+    const API_URL = 'http://len.uiscan.com:9090';
     
     // Prepare request
     const payload = {
