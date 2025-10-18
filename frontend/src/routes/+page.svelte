@@ -61,33 +61,47 @@
       messages = [...messages, assistantMessage];
       const messageIndex = messages.length - 1;
       
+      // Buffer for incomplete lines
+      let buffer = '';
+      
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         
-        // Decode chunk
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
+        // Decode chunk and add to buffer
+        buffer += decoder.decode(value, { stream: true });
         
+        // Split by newlines
+        const lines = buffer.split('\n');
+        
+        // Keep the last incomplete line in buffer
+        buffer = lines.pop() || '';
+        
+        // Process complete lines
         for (const line of lines) {
           if (line.startsWith('data: ')) {
-            const data = JSON.parse(line.slice(6));
-            
-            if (data.type === 'token') {
-              // Append token to message
-              messages[messageIndex].content += data.content;
-              messages = messages; // Trigger reactivity
-            } else if (data.type === 'artifact') {
-              // Add artifact
-              artifacts = [...artifacts, data.artifact];
-            } else if (data.type === 'done') {
-              // Stream complete
-              return;
-            } else if (data.type === 'error') {
-              console.error('Stream error:', data.message);
-              messages[messageIndex].content += `\n\n[Error: ${data.message}]`;
-              messages = messages;
-              return;
+            try {
+              const data = JSON.parse(line.slice(6));
+              
+              if (data.type === 'token') {
+                // Append token to message
+                messages[messageIndex].content += data.content;
+                messages = messages; // Trigger reactivity
+              } else if (data.type === 'artifact') {
+                // Add artifact
+                artifacts = [...artifacts, data.artifact];
+              } else if (data.type === 'done') {
+                // Stream complete
+                return;
+              } else if (data.type === 'error') {
+                console.error('Stream error:', data.message);
+                messages[messageIndex].content += `\n\n[Error: ${data.message}]`;
+                messages = messages;
+                return;
+              }
+            } catch (e) {
+              // Skip malformed JSON (empty lines, etc.)
+              console.warn('Skipped line:', line);
             }
           }
         }
