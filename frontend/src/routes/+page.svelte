@@ -25,7 +25,7 @@
   }
   
   async function streamResponse(message) {
-    const API_URL = 'https://len.uiscan.com:9090/chat';
+    const API_URL = 'https://len.uiscan.com:9090';
     
     // Prepare request
     const payload = {
