@@ -56,6 +56,9 @@ MODEL_NAME = "nvidia/nemotron-nano-9b-v2:free"  # Free tier, upgrade to paid if 
 # ============================================================================
 # CORS Configuration
 # ============================================================================
+origins = [
+    "https://thorlorick.netlify.app"
+]
 
 app.add_middleware(
     CORSMiddleware,
