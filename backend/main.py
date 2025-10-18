@@ -62,10 +62,11 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://thorlorick.netlify.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+
 )
 
 @app.options("/chat")
