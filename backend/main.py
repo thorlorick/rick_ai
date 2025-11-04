@@ -102,30 +102,6 @@ class SimpleRateLimiter:
 rate_limiter = SimpleRateLimiter()
 
 # ============================================================================ #
-# FastAPI App
-# ============================================================================ #
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("🚀 Rick GradeInsight starting up...")
-    yield
-    print("👋 Rick GradeInsight shutting down...")
-
-app = FastAPI(
-    title="Rick GradeInsight Backend",
-    version="1.0.0-ollama",
-    lifespan=lifespan
-)
-
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ============================================================================ #
 # Ollama LLM Engine
 # ============================================================================ #
 class OllamaEngine:
@@ -258,6 +234,40 @@ Be conversational but professional. Focus on helping teachers make informed deci
             return False
 
 # ============================================================================ #
+# Initialize LLM at module level
+# ============================================================================ #
+print("Initializing Ollama engine...")
+llm = OllamaEngine()
+print("✓ LLM engine initialized")
+
+# ============================================================================ #
+# FastAPI App
+# ============================================================================ #
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 Rick GradeInsight starting up...")
+    # Test Ollama connection
+    if llm:
+        await llm.test_connection()
+    yield
+    print("👋 Rick GradeInsight shutting down...")
+
+app = FastAPI(
+    title="Rick GradeInsight Backend",
+    version="1.0.0-ollama",
+    lifespan=lifespan
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================================================ #
 # Request/Response Models
 # ============================================================================ #
 class ChatMessage(BaseModel):
@@ -329,19 +339,6 @@ def get_client_id(request: Request) -> str:
 # ============================================================================ #
 # API Endpoints
 # ============================================================================ #
-llm = None
-
-@app.on_event("startup")
-async def startup_event():
-    global llm
-    try:
-        llm = OllamaEngine()
-        await llm.test_connection()
-        print("✓ Rick GradeInsight ready!")
-    except Exception as e:
-        print(f"⚠ Ollama initialization failed: {e}")
-        llm = OllamaEngine()  # Create anyway, will error on use
-
 @app.get("/")
 async def root():
     return {
