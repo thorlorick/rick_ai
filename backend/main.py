@@ -75,6 +75,33 @@ class AppMetrics:
 metrics = AppMetrics()
 
 # ============================================================================ #
+# Simple Rate Limiter
+# ============================================================================ #
+class SimpleRateLimiter:
+    def __init__(self, max_requests: int = 60, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = defaultdict(list)
+    
+    def is_allowed(self, client_id: str) -> bool:
+        now = time.time()
+        # Clean old requests
+        self.requests[client_id] = [
+            req_time for req_time in self.requests[client_id]
+            if now - req_time < self.window_seconds
+        ]
+        
+        # Check limit
+        if len(self.requests[client_id]) >= self.max_requests:
+            return False
+        
+        # Add new request
+        self.requests[client_id].append(now)
+        return True
+
+rate_limiter = SimpleRateLimiter()
+
+# ============================================================================ #
 # FastAPI App
 # ============================================================================ #
 @asynccontextmanager
@@ -115,8 +142,10 @@ class OllamaEngine:
         """Rough token estimation"""
         return len(text) // 4
 
-    def build_system_prompt(self, teacher_id: int) -> str:
+    def build_system_prompt(self, teacher_id: int = None) -> str:
         """Build system prompt for teacher assistant"""
+        teacher_info = f"Current teacher ID: {teacher_id}\n" if teacher_id else ""
+        
         return f"""You are Rick, an intelligent teaching assistant for GradeInsight. You help teachers analyze student grades and performance.
 
 Your role:
@@ -126,8 +155,7 @@ Your role:
 - Answer questions about grades, assignments, and trends
 - Be concise, helpful, and data-driven
 
-Current teacher ID: {teacher_id}
-
+{teacher_info}
 When asked about students or grades:
 1. Use the provided database query results
 2. Present findings clearly with specific numbers
@@ -147,7 +175,7 @@ Be conversational but professional. Focus on helping teachers make informed deci
         self, 
         message: str, 
         history: List, 
-        teacher_id: int,
+        teacher_id: int = None,
         query_results: Optional[Dict] = None
     ) -> str:
         """Build prompt for Ollama"""
@@ -161,11 +189,12 @@ Be conversational but professional. Focus on helping teachers make informed deci
             prompt += "\n=== End Results ===\n\n"
 
         # Add conversation history (last 6 messages)
-        prompt += "=== Conversation History ===\n"
-        for msg in history[-6:]:
-            role = msg['role'].upper()
-            content = msg.get('content', '')
-            prompt += f"{role}: {content}\n\n"
+        if history:
+            prompt += "=== Conversation History ===\n"
+            for msg in history[-6:]:
+                role = msg.get('role', 'user').upper()
+                content = msg.get('content', '')
+                prompt += f"{role}: {content}\n\n"
 
         # Add current message
         prompt += f"USER: {message}\n\nASSISTANT: "
@@ -238,17 +267,20 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=10000)
-    conversation_history: List[ChatMessage] = []
-    teacher_id: int = Field(default=1, gt=0)
+    conversation_history: List[ChatMessage] = Field(default_factory=list)
+    teacher_id: Optional[int] = Field(default=1, gt=0)
     conversation_id: Optional[str] = None
-    max_tokens: int = Field(2048, ge=100, le=8192)
-    temperature: float = Field(0.7, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=2048, ge=100, le=8192)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
 
 # ============================================================================ #
 # Grade Analysis Tools
 # ============================================================================ #
 def analyze_query_intent(message: str, teacher_id: int) -> Optional[Dict]:
     """Determine if message needs database query and execute it"""
+    if not DB_ENABLED or not db:
+        return None
+        
     message_lower = message.lower()
     
     # Check for struggling students query
@@ -330,11 +362,7 @@ async def chat_endpoint(request: ChatRequest, req: Request):
         metrics.record_error()
         raise HTTPException(status_code=503, detail="LLM not initialized")
 
-    if not DB_ENABLED:
-        metrics.record_error()
-        raise HTTPException(status_code=503, detail="Database not available")
-
-    # Rate limiting
+    # Rate limiting (optional - comment out if causing issues)
     client_id = get_client_id(req)
     if not rate_limiter.is_allowed(client_id):
         metrics.record_error()
@@ -352,7 +380,7 @@ async def chat_endpoint(request: ChatRequest, req: Request):
 
             # STEP 2: Analyze query intent and fetch data if needed
             query_results = None
-            if DB_ENABLED:
+            if DB_ENABLED and request.teacher_id:
                 query_results = analyze_query_intent(request.message, request.teacher_id)
                 
                 if query_results:
@@ -363,14 +391,15 @@ async def chat_endpoint(request: ChatRequest, req: Request):
                         "type": "tool_result",
                         "tool_name": query_type,
                         "success": True,
-                        "record_count": len(query_results.get('results', []))
+                        "record_count": len(query_results.get('results', [])) if isinstance(query_results.get('results'), list) else 1
                     })
                     yield f"data: {tool_data}\n\n"
 
             # STEP 3: Build prompt with query results
+            history = [dict(msg) for msg in request.conversation_history]
             prompt = llm.build_prompt_messages(
                 request.message,
-                request.conversation_history,
+                history,
                 request.teacher_id,
                 query_results=query_results
             )
@@ -391,18 +420,21 @@ async def chat_endpoint(request: ChatRequest, req: Request):
 
             # STEP 5: Save to vector memory if enabled
             if MEMORY_ENABLED and vector_memory:
-                vector_memory.add_message(
-                    conversation_id=conversation_id,
-                    role="user",
-                    content=request.message,
-                    timestamp=datetime.now().isoformat()
-                )
-                vector_memory.add_message(
-                    conversation_id=conversation_id,
-                    role="assistant",
-                    content=full_response,
-                    timestamp=datetime.now().isoformat()
-                )
+                try:
+                    vector_memory.add_message(
+                        conversation_id=conversation_id,
+                        role="user",
+                        content=request.message,
+                        timestamp=datetime.now().isoformat()
+                    )
+                    vector_memory.add_message(
+                        conversation_id=conversation_id,
+                        role="assistant",
+                        content=full_response,
+                        timestamp=datetime.now().isoformat()
+                    )
+                except Exception as e:
+                    print(f"⚠ Memory save failed: {e}")
 
             # Record metrics
             duration = time.time() - start_time
@@ -412,6 +444,8 @@ async def chat_endpoint(request: ChatRequest, req: Request):
 
         except Exception as e:
             print(f"[Error] {str(e)}")
+            import traceback
+            traceback.print_exc()
             metrics.record_error()
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
         
@@ -431,7 +465,12 @@ async def chat_endpoint(request: ChatRequest, req: Request):
 
 @app.get("/health")
 async def health_check():
-    llm_status = "connected" if llm and await llm.test_connection() else "disconnected"
+    llm_status = "disconnected"
+    if llm:
+        try:
+            llm_status = "connected" if await llm.test_connection() else "disconnected"
+        except:
+            llm_status = "error"
     
     return {
         "status": "healthy",
@@ -450,12 +489,15 @@ async def get_metrics():
     }
     
     if MEMORY_ENABLED and vector_memory:
-        stats["memory_stats"] = vector_memory.get_stats()
+        try:
+            stats["memory_stats"] = vector_memory.get_stats()
+        except:
+            pass
     
     return stats
 
 # ============================================================================ #
-# Database Query Endpoints
+# Database Query Endpoints (Optional)
 # ============================================================================ #
 @app.get("/api/students/struggling/{teacher_id}")
 async def get_struggling(teacher_id: int, threshold: float = 70.0):
