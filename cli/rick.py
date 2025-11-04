@@ -17,7 +17,7 @@ from rich.live import Live
 from rich.spinner import Spinner
 
 # Configuration
-API_URL = "https://len.uiscan.com:8090"
+API_URL = "http://127.0.0.1:8090"
 CONFIG_DIR = Path.home() / ".rick"
 CONVERSATIONS_DIR = CONFIG_DIR / "conversations"
 PROJECTS_DIR = CONFIG_DIR / "projects"
