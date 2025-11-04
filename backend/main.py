@@ -239,7 +239,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=10000)
     conversation_history: List[ChatMessage] = []
-    teacher_id: int = Field(..., gt=0)
+    teacher_id: int = Field(default=1, gt=0)
     conversation_id: Optional[str] = None
     max_tokens: int = Field(2048, ge=100, le=8192)
     temperature: float = Field(0.7, ge=0.0, le=2.0)
