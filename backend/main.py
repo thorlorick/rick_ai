@@ -1,344 +1,447 @@
 """
-Rick_AI Backend Server with OpenRouter
-FastAPI server with streaming LLM responses, vector memory, and calendar integration
+Rick AI - GradeInsight Backend (Ollama Local)
+FastAPI server for grade analysis with local LLM
 """
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 import json
-import re
-from datetime import datetime
-import asyncio
 import os
+import uuid
+import time
+import asyncio
+import httpx
+from datetime import datetime
+from contextlib import asynccontextmanager
+from collections import defaultdict
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
 
 # Load environment variables
 load_dotenv()
 
-# Import memory managers
-from memory import ConversationMemory
-from vector_memory import VectorMemory
-
-# Import calendar tool
+# Import database connection
 try:
-    from calendar_tool import GoogleCalendarTool
-    calendar_tool = GoogleCalendarTool()
-    CALENDAR_ENABLED = True
-    print("✓ Google Calendar connected!")
+    from db_connection import GradeInsightDB
+    db = GradeInsightDB()
+    DB_ENABLED = True
+    print("✓ GradeInsight database connected!")
 except Exception as e:
-    calendar_tool = None
-    CALENDAR_ENABLED = False
-    print(f"⚠ Google Calendar not available: {e}")
+    db = None
+    DB_ENABLED = False
+    print(f"⚠ Database not available: {e}")
 
-app = FastAPI(title="Rick_AI Backend", version="2.0.0")
+# Import vector memory for conversation context
+try:
+    from vector_memory import VectorMemory
+    vector_memory = VectorMemory()
+    MEMORY_ENABLED = True
+    print("✓ Vector memory initialized!")
+except Exception as e:
+    vector_memory = None
+    MEMORY_ENABLED = False
+    print(f"⚠ Vector memory disabled (optional feature): {str(e)[:100]}")
 
-# Initialize memory systems
-memory = ConversationMemory()
-vector_memory = VectorMemory()
+# ============================================================================ #
+# Application Metrics
+# ============================================================================ #
+class AppMetrics:
+    def __init__(self):
+        self.startup_time = time.time()
+        self.request_count = 0
+        self.error_count = 0
+        self.total_response_time = 0.0
+        self.active_conversations = set()
+        
+    def record_request(self, duration: float):
+        self.request_count += 1
+        self.total_response_time += duration
+        
+    def record_error(self):
+        self.error_count += 1
+        
+    def get_stats(self):
+        uptime = time.time() - self.startup_time
+        avg_response = self.total_response_time / max(self.request_count, 1)
+        return {
+            "uptime_seconds": round(uptime, 2),
+            "requests_processed": self.request_count,
+            "errors": self.error_count,
+            "avg_response_time_seconds": round(avg_response, 2),
+            "active_conversations": len(self.active_conversations)
+        }
 
-# Initialize OpenRouter client
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    print("⚠ WARNING: OPENROUTER_API_KEY not found in .env file")
+metrics = AppMetrics()
 
-client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
+# ============================================================================ #
+# Rate Limiting
+# ============================================================================ #
+class RateLimiter:
+    def __init__(self, max_requests: int = 60, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = defaultdict(list)
+    
+    def is_allowed(self, client_id: str) -> bool:
+        now = time.time()
+        self.requests[client_id] = [
+            req_time for req_time in self.requests[client_id]
+            if now - req_time < self.window_seconds
+        ]
+        
+        if len(self.requests[client_id]) >= self.max_requests:
+            return False
+        
+        self.requests[client_id].append(now)
+        return True
+
+rate_limiter = RateLimiter(max_requests=60, window_seconds=60)
+
+# ============================================================================ #
+# FastAPI App
+# ============================================================================ #
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 Rick GradeInsight starting up...")
+    yield
+    print("👋 Rick GradeInsight shutting down...")
+
+app = FastAPI(
+    title="Rick GradeInsight Backend",
+    version="1.0.0-ollama",
+    lifespan=lifespan
 )
 
-# Model configuration
-MODEL_NAME = "nvidia/nemotron-nano-9b-v2:free"  # Free tier, upgrade to paid if needed
-# MODEL_NAME = "nvidia/nemotron-nano-9b-v2"  # Paid tier (better quality/speed)
-
-# ============================================================================
-# CORS Configuration
-# ============================================================================
-
-
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-
 )
 
-@app.options("/chat")
-async def chat_options():
-    """Handle CORS preflight"""
-    return {}
+# ============================================================================ #
+# Ollama LLM Engine
+# ============================================================================ #
+class OllamaEngine:
+    """Handles interaction with local Ollama for grade analysis"""
 
-# ============================================================================
-# Models / Schemas
-# ============================================================================
+    def __init__(self, model_name: str = None):
+        self.model_name = model_name or os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        self.max_context_tokens = 4000
+        print(f"✓ Ollama engine configured: {self.model_name}")
+        print(f"  Endpoint: {self.base_url}")
 
+    def estimate_tokens(self, text: str) -> int:
+        """Rough token estimation"""
+        return len(text) // 4
+
+    def build_system_prompt(self, teacher_id: int) -> str:
+        """Build system prompt for teacher assistant"""
+        return f"""You are Rick, an intelligent teaching assistant for GradeInsight. You help teachers analyze student grades and performance.
+
+Your role:
+- Analyze student performance data from the database
+- Identify struggling students and patterns
+- Provide actionable insights for teachers
+- Answer questions about grades, assignments, and trends
+- Be concise, helpful, and data-driven
+
+Current teacher ID: {teacher_id}
+
+When asked about students or grades:
+1. Use the provided database query results
+2. Present findings clearly with specific numbers
+3. Highlight important patterns or concerns
+4. Suggest practical next steps
+
+Available data:
+- Student grades and averages
+- Assignment completion rates
+- Missing assignments
+- Grade trends over time
+- Teacher notes
+
+Be conversational but professional. Focus on helping teachers make informed decisions about student support."""
+
+    def build_prompt_messages(
+        self, 
+        message: str, 
+        history: List, 
+        teacher_id: int,
+        query_results: Optional[Dict] = None
+    ) -> str:
+        """Build prompt for Ollama"""
+        # System prompt
+        prompt = self.build_system_prompt(teacher_id) + "\n\n"
+
+        # Add query results if available
+        if query_results:
+            prompt += "=== Database Query Results ===\n"
+            prompt += json.dumps(query_results, indent=2, default=str)
+            prompt += "\n=== End Results ===\n\n"
+
+        # Add conversation history (last 6 messages)
+        prompt += "=== Conversation History ===\n"
+        for msg in history[-6:]:
+            role = msg['role'].upper()
+            content = msg.get('content', '')
+            prompt += f"{role}: {content}\n\n"
+
+        # Add current message
+        prompt += f"USER: {message}\n\nASSISTANT: "
+
+        return prompt
+
+    async def generate_stream(self, prompt: str, **generation_params):
+        """Stream responses from Ollama"""
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream(
+                    'POST',
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "stream": True,
+                        **generation_params
+                    }
+                ) as response:
+                    response.raise_for_status()
+                    
+                    async for line in response.aiter_lines():
+                        if line:
+                            try:
+                                data = json.loads(line)
+                                if 'response' in data:
+                                    yield data['response']
+                                if data.get('done', False):
+                                    break
+                            except json.JSONDecodeError:
+                                continue
+
+        except httpx.ConnectError:
+            print("❌ Cannot connect to Ollama. Is it running?")
+            yield "\n\n[Error: Cannot connect to Ollama. Run: ollama serve]"
+        except Exception as e:
+            print(f"❌ Error in streaming: {e}")
+            yield f"\n\n[Error: {str(e)}]"
+
+    async def test_connection(self) -> bool:
+        """Test if Ollama is accessible"""
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{self.base_url}/api/tags")
+                if response.status_code == 200:
+                    models = response.json().get('models', [])
+                    model_names = [m['name'] for m in models]
+                    print(f"✓ Ollama connected. Available models: {model_names}")
+                    
+                    # Check if our model is available
+                    if self.model_name in model_names:
+                        print(f"✓ Model '{self.model_name}' is ready")
+                        return True
+                    else:
+                        print(f"⚠ Model '{self.model_name}' not found. Run: ollama pull {self.model_name}")
+                        return False
+                return False
+        except Exception as e:
+            print(f"⚠ Ollama not reachable: {e}")
+            return False
+
+# ============================================================================ #
+# Request/Response Models
+# ============================================================================ #
 class ChatMessage(BaseModel):
     role: str
     content: str
     timestamp: Optional[str] = None
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(..., min_length=1, max_length=10000)
     conversation_history: List[ChatMessage] = []
-    max_tokens: int = 1024
-    temperature: float = 0.7
+    teacher_id: int = Field(..., gt=0)
+    conversation_id: Optional[str] = None
+    max_tokens: int = Field(2048, ge=100, le=8192)
+    temperature: float = Field(0.7, ge=0.0, le=2.0)
 
-class Artifact(BaseModel):
-    id: str
-    language: str
-    code: str
-    filename: Optional[str] = None
-
-# ============================================================================
-# LLM Engine (OpenRouter)
-# ============================================================================
-
-class OpenRouterEngine:
-    """Handles interaction with OpenRouter API"""
+# ============================================================================ #
+# Grade Analysis Tools
+# ============================================================================ #
+def analyze_query_intent(message: str, teacher_id: int) -> Optional[Dict]:
+    """Determine if message needs database query and execute it"""
+    message_lower = message.lower()
     
-    def __init__(self):
-        self.model = MODEL_NAME
-        print(f"✓ Using model: {self.model}")
+    # Check for struggling students query
+    if any(word in message_lower for word in ['struggling', 'failing', 'below', 'low grade']):
+        print(f"[Tool] Detected: Struggling students query")
+        results = db.get_struggling_students(teacher_id)
+        return {"query_type": "struggling_students", "results": results}
     
-    def build_prompt_messages(
-        self, 
-        message: str, 
-        history: List[ChatMessage],
-        conversation_id: Optional[str] = None
-    ) -> List[Dict]:
-        """Build messages array for OpenRouter API with memory and calendar"""
-        
-        # System message
-        system_content = """You are Rick, a skilled coding assistant with access to the user's Google Calendar and memory of past conversations.
-
-You help users with:
-- Writing clean, efficient code
-- Debugging and explaining code
-- Answering programming questions
-- Providing best practices and patterns
-- Checking their calendar when asked
-- Remembering past conversations
-
-When writing code, use markdown code blocks with the language specified.
-Keep responses concise but thorough. Be helpful and encouraging."""
-
-        # Check for calendar query
-        calendar_keywords = ['calendar', 'schedule', 'meeting', 'event', 'appointment', 'today', 'tomorrow', 'this week']
-        is_calendar_query = any(keyword in message.lower() for keyword in calendar_keywords)
-        
-        # Add calendar context
-        if is_calendar_query and CALENDAR_ENABLED and calendar_tool:
-            try:
-                events = calendar_tool.get_events_this_week()
-                if events:
-                    system_content += "\n\n=== USER'S CALENDAR ===\n"
-                    system_content += calendar_tool.format_events_for_llm(events)
-                    system_content += "=======================\n"
-            except Exception as e:
-                print(f"Error fetching calendar: {e}")
-        
-        # Get relevant memories
-        if message and conversation_id:
-            memory_context = vector_memory.get_conversation_context(
-                query=message,
-                n_results=3,
-                exclude_conversation=conversation_id
-            )
-            if memory_context:
-                system_content += "\n\n" + memory_context
-        
-        # Build messages array
-        messages = [{"role": "system", "content": system_content}]
-        
-        # Add conversation history (last 6 messages)
-        for msg in history[-6:]:
-            messages.append({
-                "role": msg.role,
-                "content": msg.content
-            })
-        
-        # Add current message
-        messages.append({
-            "role": "user",
-            "content": message
-        })
-        
-        return messages
+    # Check for specific student query
+    if 'student' in message_lower and any(word in message_lower for word in ['id', 'number', '#']):
+        import re
+        match = re.search(r'(?:id|student|#)\s*(\d+)', message_lower)
+        if match:
+            student_id = int(match.group(1))
+            print(f"[Tool] Detected: Student detail query for ID {student_id}")
+            result = db.get_student_detail(teacher_id, student_id)
+            return {"query_type": "student_detail", "student_id": student_id, "results": result}
     
-    async def generate_stream(
-        self,
-        messages: List[Dict],
-        max_tokens: int = 1024,
-        temperature: float = 0.7
-    ):
-        """Generate streaming response from OpenRouter"""
-        
-        try:
-            stream = await client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stream=True
-            )
-            
-            async for chunk in stream:
-                if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
-                    
-        except Exception as e:
-            print(f"OpenRouter API error: {e}")
-            yield f"\n\n[Error: {str(e)}]"
-
-# ============================================================================
-# Artifact Parser
-# ============================================================================
-
-class ArtifactParser:
-    """Extract code artifacts from LLM responses"""
+    # Check for assignment analysis
+    if any(word in message_lower for word in ['assignment', 'hardest', 'difficult', 'lowest']):
+        print(f"[Tool] Detected: Assignment analysis query")
+        results = db.get_assignment_analysis(teacher_id)
+        return {"query_type": "assignment_analysis", "results": results}
     
-    @staticmethod
-    def extract_artifacts(text: str) -> List[Artifact]:
-        """Find all code blocks in markdown format"""
-        
-        pattern = r'```(\w+)?\n(.*?)```'
-        matches = re.finditer(pattern, text, re.DOTALL)
-        
-        artifacts = []
-        for i, match in enumerate(matches):
-            language = match.group(1) or "text"
-            code = match.group(2).strip()
-            
-            artifact = Artifact(
-                id=f"artifact_{i}_{datetime.now().timestamp()}",
-                language=language,
-                code=code,
-                filename=ArtifactParser._suggest_filename(language, code)
-            )
-            artifacts.append(artifact)
-        
-        return artifacts
+    # Check for missing assignments
+    if 'missing' in message_lower:
+        print(f"[Tool] Detected: Missing assignments query")
+        results = db.get_students_with_missing_work(teacher_id)
+        return {"query_type": "missing_assignments", "results": results}
     
-    @staticmethod
-    def _suggest_filename(language: str, code: str) -> str:
-        """Suggest a filename based on language"""
-        
-        extensions = {
-            "python": "script.py",
-            "javascript": "script.js",
-            "typescript": "script.ts",
-            "html": "index.html",
-            "css": "styles.css",
-            "rust": "main.rs",
-            "go": "main.go",
-            "java": "Main.java",
-            "cpp": "main.cpp",
-            "c": "main.c",
-        }
-        
-        return extensions.get(language.lower(), f"code.{language}")
+    # Check for class overview
+    if any(word in message_lower for word in ['class', 'overview', 'summary', 'average']):
+        print(f"[Tool] Detected: Class overview query")
+        results = db.get_class_overview(teacher_id)
+        return {"query_type": "class_overview", "results": results}
+    
+    return None
 
-# ============================================================================
+def get_client_id(request: Request) -> str:
+    """Get client identifier for rate limiting"""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0]
+    return request.client.host if request.client else "unknown"
+
+# ============================================================================ #
 # API Endpoints
-# ============================================================================
-
-# Global engine instance
+# ============================================================================ #
 llm = None
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize OpenRouter engine"""
     global llm
-    
-    if not OPENROUTER_API_KEY:
-        print("✗ OpenRouter API key not found!")
-        print("  Add OPENROUTER_API_KEY to .env file")
-        return
-    
     try:
-        llm = OpenRouterEngine()
-        print("✓ Rick_AI backend ready with OpenRouter!")
+        llm = OllamaEngine()
+        await llm.test_connection()
+        print("✓ Rick GradeInsight ready!")
     except Exception as e:
-        print(f"✗ Failed to initialize: {e}")
+        print(f"⚠ Ollama initialization failed: {e}")
+        llm = OllamaEngine()  # Create anyway, will error on use
 
 @app.get("/")
 async def root():
-    """Health check"""
     return {
         "status": "online",
-        "engine": "openrouter",
-        "model": MODEL_NAME,
-        "calendar_enabled": CALENDAR_ENABLED,
-        "message": "Rick_AI Backend API"
+        "service": "Rick GradeInsight",
+        "engine": "ollama",
+        "model": llm.model_name if llm else "unknown",
+        "database_enabled": DB_ENABLED,
+        "memory_enabled": MEMORY_ENABLED,
+        "version": "1.0.0-ollama"
     }
 
 @app.post("/chat")
-async def chat_endpoint(request: ChatRequest, conversation_id: Optional[str] = None):
-    """Main chat endpoint with streaming, memory, and calendar support"""
-
+async def chat_endpoint(request: ChatRequest, req: Request):
+    start_time = time.time()
+    
     if llm is None:
-        raise HTTPException(status_code=503, detail="LLM engine not initialized")
-    if not OPENROUTER_API_KEY:
-        raise HTTPException(status_code=503, detail="OpenRouter API key not configured")
+        metrics.record_error()
+        raise HTTPException(status_code=503, detail="LLM not initialized")
 
-    # Use provided conversation_id or create a new one
-    conversation_id = conversation_id or f"conv-{datetime.now().timestamp()}"
+    if not DB_ENABLED:
+        metrics.record_error()
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    # Rate limiting
+    client_id = get_client_id(req)
+    if not rate_limiter.is_allowed(client_id):
+        metrics.record_error()
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    conversation_id = request.conversation_id or str(uuid.uuid4())
+    
+    if conversation_id not in metrics.active_conversations:
+        metrics.active_conversations.add(conversation_id)
 
     async def event_generator():
-        """Generate streaming SSE events"""
-
         try:
-            # Store user message in vector memory
-            vector_memory.add_message(
-                conversation_id=conversation_id,
-                role="user",
-                content=request.message,
-                timestamp=datetime.now().isoformat()
-            )
+            # STEP 1: Send typing indicator
+            yield f"data: {json.dumps({'type': 'status', 'content': 'Analyzing...'})}\n\n"
 
-            # Build messages for LLM
-            messages = await asyncio.to_thread(
-                llm.build_prompt_messages,
+            # STEP 2: Analyze query intent and fetch data if needed
+            query_results = None
+            if DB_ENABLED:
+                query_results = analyze_query_intent(request.message, request.teacher_id)
+                
+                if query_results:
+                    query_type = query_results.get('query_type', 'unknown')
+                    yield f"data: {json.dumps({'type': 'status', 'content': f'Fetching {query_type}...'})}\n\n"
+                    
+                    tool_data = json.dumps({
+                        "type": "tool_result",
+                        "tool_name": query_type,
+                        "success": True,
+                        "record_count": len(query_results.get('results', []))
+                    })
+                    yield f"data: {tool_data}\n\n"
+
+            # STEP 3: Build prompt with query results
+            prompt = llm.build_prompt_messages(
                 request.message,
                 request.conversation_history,
-                conversation_id
+                request.teacher_id,
+                query_results=query_results
             )
 
-            # Stream LLM response
+            # STEP 4: Generate response with streaming
+            yield f"data: {json.dumps({'type': 'status', 'content': 'Thinking...'})}\n\n"
+            
             full_response = ""
-            async for token in llm.generate_stream(
-                messages,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature
-            ):
+            
+            gen_params = {
+                "temperature": request.temperature,
+            }
+
+            async for token in llm.generate_stream(prompt, **gen_params):
                 full_response += token
                 data = json.dumps({"type": "token", "content": token})
                 yield f"data: {data}\n\n"
 
-            # Store assistant response in vector memory
-            vector_memory.add_message(
-                conversation_id=conversation_id,
-                role="assistant",
-                content=full_response,
-                timestamp=datetime.now().isoformat()
-            )
+            # STEP 5: Save to vector memory if enabled
+            if MEMORY_ENABLED and vector_memory:
+                vector_memory.add_message(
+                    conversation_id=conversation_id,
+                    role="user",
+                    content=request.message,
+                    timestamp=datetime.now().isoformat()
+                )
+                vector_memory.add_message(
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=full_response,
+                    timestamp=datetime.now().isoformat()
+                )
 
-            # Extract and send artifacts
-            artifacts = ArtifactParser.extract_artifacts(full_response)
-            for artifact in artifacts:
-                data = json.dumps({"type": "artifact", "artifact": artifact.dict()})
-                yield f"data: {data}\n\n"
+            # Record metrics
+            duration = time.time() - start_time
+            metrics.record_request(duration)
 
-            # Completion
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         except Exception as e:
-            error_data = json.dumps({"type": "error", "message": str(e)})
-            yield f"data: {error_data}\n\n"
+            print(f"[Error] {str(e)}")
+            metrics.record_error()
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        
+        finally:
+            if conversation_id in metrics.active_conversations:
+                metrics.active_conversations.discard(conversation_id)
 
     return StreamingResponse(
         event_generator(),
@@ -346,93 +449,59 @@ async def chat_endpoint(request: ChatRequest, conversation_id: Optional[str] = N
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         }
     )
 
-
 @app.get("/health")
 async def health_check():
-    """Detailed health check"""
+    llm_status = "connected" if llm and await llm.test_connection() else "disconnected"
+    
     return {
         "status": "healthy",
-        "engine": "openrouter",
-        "model": MODEL_NAME,
-        "calendar_enabled": CALENDAR_ENABLED,
-        "api_key_configured": bool(OPENROUTER_API_KEY),
+        "llm_status": llm_status,
+        "database_status": "connected" if DB_ENABLED else "disconnected",
+        "memory_status": "enabled" if MEMORY_ENABLED else "disabled",
+        "model": llm.model_name if llm else "unknown",
         "timestamp": datetime.now().isoformat()
     }
 
-# ============================================================================
-# Memory Endpoints
-# ============================================================================
-
-@app.get("/conversations/stats")
-async def get_storage_stats():
-    """Get storage statistics"""
-    file_stats = memory.get_storage_stats()
-    vector_stats = vector_memory.get_stats()
-    
-    return {
-        "file_storage": file_stats,
-        "vector_memory": vector_stats
+@app.get("/metrics")
+async def get_metrics():
+    """Get application metrics"""
+    stats = {
+        "app_metrics": metrics.get_stats()
     }
-
-@app.post("/memory/search")
-async def search_memory(query: str, n_results: int = 5):
-    """Search vector memory"""
-    results = vector_memory.search_memory(query, n_results=n_results)
     
-    formatted = []
-    if results["documents"][0]:
-        for doc, meta, distance in zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0]
-        ):
-            formatted.append({
-                "content": doc,
-                "metadata": meta,
-                "similarity": 1 - distance
-            })
+    if MEMORY_ENABLED and vector_memory:
+        stats["memory_stats"] = vector_memory.get_stats()
     
-    return {"results": formatted, "count": len(formatted)}
+    return stats
 
-# ============================================================================
-# Calendar Endpoints
-# ============================================================================
+# ============================================================================ #
+# Database Query Endpoints
+# ============================================================================ #
+@app.get("/api/students/struggling/{teacher_id}")
+async def get_struggling(teacher_id: int, threshold: float = 70.0):
+    if not DB_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not available")
+    results = db.get_struggling_students(teacher_id, threshold)
+    return {"results": results, "count": len(results)}
 
-@app.get("/calendar/today")
-async def get_calendar_today():
-    """Get today's events"""
-    if not CALENDAR_ENABLED:
-        raise HTTPException(status_code=503, detail="Calendar not available")
-    
-    try:
-        events = calendar_tool.get_events_today()
-        return {
-            "events": events,
-            "count": len(events),
-            "formatted": calendar_tool.format_events_for_llm(events)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/api/student/{teacher_id}/{student_id}")
+async def get_student(teacher_id: int, student_id: int):
+    if not DB_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not available")
+    result = db.get_student_detail(teacher_id, student_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return result
 
-@app.get("/calendar/week")
-async def get_calendar_week():
-    """Get this week's events"""
-    if not CALENDAR_ENABLED:
-        raise HTTPException(status_code=503, detail="Calendar not available")
-    
-    try:
-        events = calendar_tool.get_events_this_week()
-        return {
-            "events": events,
-            "count": len(events),
-            "formatted": calendar_tool.format_events_for_llm(events)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/api/assignments/analysis/{teacher_id}")
+async def get_assignments(teacher_id: int):
+    if not DB_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not available")
+    results = db.get_assignment_analysis(teacher_id)
+    return {"results": results, "count": len(results)}
 
-# ============================================================================
-# Run with: uvicorn main:app --host 0.0.0.0 --port 8000
-# ============================================================================
+# Run with: uvicorn main:app --host 127.0.0.1 --port 8090 --reload
