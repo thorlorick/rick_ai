@@ -17,8 +17,8 @@ class GradeInsightDB:
         # Get credentials from environment
         db_config = {
             'host': os.getenv('DB_HOST', 'localhost'),
-            'port': os.getenv('DB_PORT', '3306'),
-            'user': os.getenv('DB_USER_READONLY', 'rick_readonly'),
+            'port': os.getenv('DB_PORT', '8090'),
+            'user': os.getenv('DB_USER_READONLY', 'RICK'),
             'password': os.getenv('DB_PASSWORD_READONLY'),
             'database': os.getenv('DB_NAME', 'grade_insight')
         }
