@@ -207,22 +207,29 @@ class RickCLI:
         }
         
         try:
-            console.print("\n[blue]Rick:[/blue]")
+            console.print("\n[blue]Rick:[/blue] ", end='')
             
             response_text = ""
+            done = False
             
             # Stream response
             with requests.post(
                 f"{API_URL}/chat",
                 json=payload,
                 stream=True,
-                timeout=60
+                timeout=120
             ) as response:
                 response.raise_for_status()
                 
                 for line in response.iter_lines():
                     if line:
                         line = line.decode('utf-8')
+                        
+                        # Skip empty lines
+                        if not line.strip():
+                            continue
+                        
+                        # Parse SSE format
                         if line.startswith('data: '):
                             try:
                                 data = json.loads(line[6:])
@@ -230,29 +237,52 @@ class RickCLI:
                                 if data['type'] == 'token':
                                     token = data['content']
                                     response_text += token
-                                    console.print(token, end='')
+                                    console.print(token, end='', style="")
+                                
+                                elif data['type'] == 'status':
+                                    # Optionally show status messages
+                                    # console.print(f"[dim]{data['content']}[/dim]", end=' ')
+                                    pass
                                 
                                 elif data['type'] == 'done':
+                                    done = True
                                     break
                                 
                                 elif data['type'] == 'error':
-                                    console.print(f"\n[red]Error: {data['message']}[/red]")
+                                    console.print(f"\n[red]Error: {data.get('message', 'Unknown error')}[/red]")
                                     return
                             
-                            except json.JSONDecodeError:
+                            except json.JSONDecodeError as e:
+                                # Skip malformed JSON
+                                console.print(f"\n[yellow]Warning: Skipped malformed data[/yellow]")
+                                continue
+                            except KeyError as e:
+                                # Missing expected field
+                                console.print(f"\n[yellow]Warning: Unexpected data format: {e}[/yellow]")
                                 continue
             
             console.print()  # New line after response
             
-            # Add assistant message
-            self.messages.append({
-                "role": "assistant",
-                "content": response_text,
-                "timestamp": datetime.now().isoformat()
-            })
+            # Only add message if we got content
+            if response_text.strip():
+                self.messages.append({
+                    "role": "assistant",
+                    "content": response_text,
+                    "timestamp": datetime.now().isoformat()
+                })
+            else:
+                console.print("[yellow]Warning: Empty response received[/yellow]")
             
+        except requests.exceptions.Timeout:
+            console.print(f"\n[red]✗ Request timed out[/red]")
+        except requests.exceptions.ConnectionError as e:
+            console.print(f"\n[red]✗ Connection error: Cannot reach server at {API_URL}[/red]")
         except requests.exceptions.RequestException as e:
-            console.print(f"\n[red]✗ Connection error: {e}[/red]")
+            console.print(f"\n[red]✗ Request error: {e}[/red]")
+        except Exception as e:
+            console.print(f"\n[red]✗ Unexpected error: {e}[/red]")
+            import traceback
+            traceback.print_exc()
     
     def handle_command(self, cmd):
         """Handle special commands"""
